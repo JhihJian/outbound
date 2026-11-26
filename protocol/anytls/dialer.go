@@ -21,7 +21,8 @@ import (
 
 const (
 	sessionReadBufferSize     = 4 << 10
-	maxIdleSessions           = 1
+	maxIdleSessions           = 4
+	maxStreamsPerSession      = 512
 	idleSessionTimeout        = 30 * time.Second
 	idleSessionCheckInterval  = 10 * time.Second
 	idleSessionProbeThreshold = 3 * time.Second
@@ -132,25 +133,33 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 			Mptcp:   magicNetwork.Mptcp,
 		}.Encode()
 
-		s, err := d.getSession(ctx, tcpNetwork)
-		if err != nil {
-			return nil, err
-		}
-		if magicNetwork.Network == "udp" {
-			streamAddr := net.JoinHostPort(mdata.Hostname, strconv.Itoa(int(mdata.Port)))
-			packetStream, err := s.newPacketStream(streamAddr, addr)
+		// A reused session may be retired between selection and use. Retry once
+		// with a fresh session instead of surfacing a spurious dial failure.
+		var lastErr error
+		for attempt := 0; attempt < 2; attempt++ {
+			s, err := d.getSession(ctx, tcpNetwork)
 			if err != nil {
-				_ = s.Close()
 				return nil, err
 			}
-			return packetStream, nil
+			if magicNetwork.Network == "udp" {
+				streamAddr := net.JoinHostPort(mdata.Hostname, strconv.Itoa(int(mdata.Port)))
+				packetStream, err := s.newPacketStream(streamAddr, addr)
+				if err != nil {
+					_ = s.Close()
+					lastErr = err
+					continue
+				}
+				return packetStream, nil
+			}
+			stream, err := s.newStream(addr)
+			if err != nil {
+				_ = s.Close()
+				lastErr = err
+				continue
+			}
+			return stream, nil
 		}
-		stream, err := s.newStream(addr)
-		if err != nil {
-			_ = s.Close()
-			return nil, err
-		}
-		return stream, nil
+		return nil, lastErr
 	default:
 		return nil, fmt.Errorf("%w: %v", netproxy.UnsupportedTunnelTypeError, magicNetwork.Network)
 	}
@@ -268,6 +277,24 @@ func (d *Dialer) popIdleSessionForReuse() (*session, error) {
 	for seq, s := range d.idleSessions {
 		delete(d.idleSessions, seq)
 		if s.closed.Load() || s.activeStreams.Load() != 0 || !s.state.CompareAndSwap(sessionStateIdle, sessionStateActive) {
+			continue
+		}
+		return s, nil
+	}
+	// A multiplexed session can carry a new stream while other streams on it are
+	// still open or half-closed. Reusing those sessions avoids a full TLS and
+	// authentication handshake per connection when the peer keeps half-closed
+	// streams around: such streams stay in s.streams, so the session never
+	// reaches sessionStateIdle and would otherwise never be reused.
+	for seq, s := range d.sessions {
+		if _, idle := d.idleSessions[seq]; idle {
+			continue
+		}
+		if s.closed.Load() || s.activeStreams.Load() >= maxStreamsPerSession {
+			continue
+		}
+		switch s.state.Load() {
+		case sessionStateClosing, sessionStateClosed:
 			continue
 		}
 		return s, nil
